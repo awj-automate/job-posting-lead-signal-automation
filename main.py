@@ -25,7 +25,7 @@ ROLES = [
     "data consultant",
 ]
 
-SITES = ["linkedin", "indeed", "glassdoor", "zip_recruiter", "google"]
+SITES = ["linkedin", "indeed", "zip_recruiter"]
 
 RESULTS_PER_ROLE = 50
 HOURS_OLD = 24
@@ -45,27 +45,27 @@ SHEET_COLUMNS = [
 def scrape_all() -> pd.DataFrame:
     frames = []
     for role in ROLES:
-        print(f"Scraping: {role}")
-        try:
-            df = scrape_jobs(
-                site_name=SITES,
-                search_term=role,
-                google_search_term=f"{role} jobs in the USA since yesterday",
-                location="United States",
-                results_wanted=RESULTS_PER_ROLE,
-                hours_old=HOURS_OLD,
-                country_indeed="USA",
-                linkedin_fetch_description=False,
-                verbose=1,
-            )
-        except Exception as e:
-            print(f"  failed: {e}")
-            continue
-        if df is None or df.empty:
-            print("  no results")
-            continue
-        df["search_role"] = role
-        frames.append(df)
+        for site in SITES:
+            print(f"Scraping: {role} @ {site}")
+            try:
+                df = scrape_jobs(
+                    site_name=[site],
+                    search_term=role,
+                    location="United States",
+                    results_wanted=RESULTS_PER_ROLE,
+                    hours_old=HOURS_OLD,
+                    country_indeed="USA",
+                    linkedin_fetch_description=False,
+                    verbose=1,
+                )
+            except Exception as e:
+                print(f"  failed: {e}")
+                continue
+            if df is None or df.empty:
+                print("  no results")
+                continue
+            df["search_role"] = role
+            frames.append(df)
     if not frames:
         return pd.DataFrame()
     return pd.concat(frames, ignore_index=True)
