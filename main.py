@@ -9,6 +9,7 @@ survivors to a Google Sheet.
 import json
 import os
 import re
+import time
 from datetime import datetime, timezone
 
 import pandas as pd
@@ -36,6 +37,10 @@ MAX_EMPLOYEES = 50
 PERPLEXITY_URL = "https://api.perplexity.ai/chat/completions"
 PERPLEXITY_MODEL = "sonar"
 PERPLEXITY_TIMEOUT = 60
+# Default tier rate limit is 50 RPM on sonar; stay just under.
+PERPLEXITY_REQUEST_SPACING = 1.3
+PERPLEXITY_MAX_RETRIES = 4
+PERPLEXITY_INITIAL_BACKOFF = 10
 
 SHEET_COLUMNS = [
     "run_timestamp_utc",
@@ -123,16 +128,38 @@ def enrich_company(company: str, api_key: str) -> dict | None:
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
-    try:
-        r = requests.post(
-            PERPLEXITY_URL, json=payload, headers=headers, timeout=PERPLEXITY_TIMEOUT
-        )
-        r.raise_for_status()
-        content = r.json()["choices"][0]["message"]["content"]
-        return _parse_enrichment_json(content)
-    except Exception as e:
-        print(f"  enrich failed for {company!r}: {e}")
-        return None
+
+    backoff = PERPLEXITY_INITIAL_BACKOFF
+    for attempt in range(PERPLEXITY_MAX_RETRIES + 1):
+        try:
+            r = requests.post(
+                PERPLEXITY_URL,
+                json=payload,
+                headers=headers,
+                timeout=PERPLEXITY_TIMEOUT,
+            )
+        except Exception as e:
+            print(f"  enrich failed for {company!r}: {e}")
+            return None
+
+        if r.status_code == 429:
+            if attempt < PERPLEXITY_MAX_RETRIES:
+                print(f"  429 for {company!r}, backing off {backoff}s (retry {attempt + 1}/{PERPLEXITY_MAX_RETRIES})")
+                time.sleep(backoff)
+                backoff *= 2
+                continue
+            print(f"  enrich failed for {company!r}: 429 after {PERPLEXITY_MAX_RETRIES} retries")
+            return None
+
+        try:
+            r.raise_for_status()
+            content = r.json()["choices"][0]["message"]["content"]
+            return _parse_enrichment_json(content)
+        except Exception as e:
+            print(f"  enrich failed for {company!r}: {e}")
+            return None
+
+    return None
 
 
 def enrich_all(df: pd.DataFrame) -> pd.DataFrame:
@@ -142,6 +169,8 @@ def enrich_all(df: pd.DataFrame) -> pd.DataFrame:
     for i, company in enumerate(df["company"], 1):
         print(f"Enriching {i}/{total}: {company}")
         enrichments.append(enrich_company(company, api_key))
+        if i < total:
+            time.sleep(PERPLEXITY_REQUEST_SPACING)
     df = df.copy()
     df["_enrichment"] = enrichments
     return df
