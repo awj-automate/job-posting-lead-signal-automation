@@ -1,10 +1,11 @@
 # job-posting-lead-signal-automation
 
 Scrapes US job postings from the last 24h across LinkedIn and Indeed for a
-fixed set of data/AI roles, dedupes by company, enriches
-each company via Perplexity for employee count + industry, filters out
-staffing/nonprofit/educational/job-platform companies and anything over 50
-employees (or unknown size), and appends the survivors to a Google Sheet.
+fixed set of data/AI roles, dedupes by company, enriches each company via
+Claude Haiku 4.5 (with server-side web search) for employee count + industry,
+filters out staffing/nonprofit/educational/job-platform companies and anything
+over 50 employees (or unknown size), and appends the survivors to a Google
+Sheet.
 
 Designed to run as a weekday-morning cron job on Railway.
 
@@ -50,6 +51,6 @@ append only — existing rows are never touched.
 1. Push this repo to GitHub.
 2. On Railway: **New Project → Deploy from GitHub repo** → select this repo.
 3. In **Variables**, set `GOOGLE_SERVICE_ACCOUNT_JSON`, `GOOGLE_SHEET_ID`,
-   `PERPLEXITY_API_KEY`, and optionally `GOOGLE_WORKSHEET_NAME`.
+   `ANTHROPIC_API_KEY`, and optionally `GOOGLE_WORKSHEET_NAME`.
 4. In **Settings → Cron Schedule**, set your weekday-morning schedule.
 5. Deploy.

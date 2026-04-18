@@ -1,19 +1,17 @@
 """
 Scrape US job postings from the last 24h across multiple boards for a fixed
-set of roles, dedupe by company, enrich each company via Perplexity for
-employee count + industry, drop staffing/nonprofit/educational/job-platform
-companies and anything over 50 employees (or unknown size), then append the
-survivors to a Google Sheet.
+set of roles, dedupe by company, enrich each company via Claude Haiku 4.5
+(with server-side web search) for employee count + industry, drop
+staffing/nonprofit/educational/job-platform companies and anything over 50
+employees (or unknown size), then append the survivors to a Google Sheet.
 """
 
 import json
 import os
-import re
-import time
 from datetime import datetime, timezone
 
+import anthropic
 import pandas as pd
-import requests
 from google.oauth2.service_account import Credentials
 import gspread
 from jobspy import scrape_jobs
@@ -34,13 +32,11 @@ RESULTS_PER_ROLE = 50
 HOURS_OLD = 24
 MAX_EMPLOYEES = 50
 
-PERPLEXITY_URL = "https://api.perplexity.ai/chat/completions"
-PERPLEXITY_MODEL = "sonar"
-PERPLEXITY_TIMEOUT = 60
-# Default tier rate limit is 50 RPM on sonar; stay just under.
-PERPLEXITY_REQUEST_SPACING = 1.3
-PERPLEXITY_MAX_RETRIES = 4
-PERPLEXITY_INITIAL_BACKOFF = 10
+CLAUDE_MODEL = "claude-haiku-4-5"
+CLAUDE_MAX_TOKENS = 1024
+CLAUDE_MAX_RETRIES = 4
+# Web search tool version — the older tool ID is widely compatible with Haiku.
+WEB_SEARCH_TOOL_VERSION = "web_search_20250305"
 
 SHEET_COLUMNS = [
     "run_timestamp_utc",
@@ -93,84 +89,108 @@ def dedupe_by_company(df: pd.DataFrame) -> pd.DataFrame:
     return df.drop(columns=["_company_key"])
 
 
-ENRICH_PROMPT = """Look up the US-based company "{company}" and return ONLY a JSON object (no prose, no markdown fences) with these exact keys:
-- employee_count: current total number of employees as an integer, or null if you cannot find a reliable figure
-- industry: short phrase (<= 12 words) describing what the company does
-- is_staffing: true if this is a staffing agency, recruiting firm, RPO, or headhunter
-- is_nonprofit: true if this is a nonprofit, NGO, foundation, or charity
-- is_educational: true if this is a K-12 school, university, college, or other educational institution
-- is_job_platform: true if this is a job board, job aggregator, or job-posting platform
+ENRICH_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "employee_count": {
+            "type": ["integer", "null"],
+            "description": "Current total number of employees. Null if not confidently known.",
+        },
+        "industry": {
+            "type": "string",
+            "description": "Short phrase (<= 12 words) describing what the company does.",
+        },
+        "is_staffing": {
+            "type": "boolean",
+            "description": "True if staffing agency, recruiting firm, RPO, or headhunter.",
+        },
+        "is_nonprofit": {
+            "type": "boolean",
+            "description": "True if nonprofit, NGO, foundation, or charity.",
+        },
+        "is_educational": {
+            "type": "boolean",
+            "description": "True if K-12 school, university, college, or educational institution.",
+        },
+        "is_job_platform": {
+            "type": "boolean",
+            "description": "True if job board, job aggregator, or job-posting platform.",
+        },
+    },
+    "required": [
+        "employee_count",
+        "industry",
+        "is_staffing",
+        "is_nonprofit",
+        "is_educational",
+        "is_job_platform",
+    ],
+    "additionalProperties": False,
+}
 
-Example output: {{"employee_count": 42, "industry": "B2B SaaS for accounting firms", "is_staffing": false, "is_nonprofit": false, "is_educational": false, "is_job_platform": false}}
+ENRICH_PROMPT = """Look up the US-based company "{company}" using web search and return the structured fields described in the output schema.
 
-If the company cannot be identified confidently, return employee_count as null."""
-
-
-def _parse_enrichment_json(text: str) -> dict:
-    text = text.strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.DOTALL)
-    start = text.find("{")
-    end = text.rfind("}")
-    if start >= 0 and end > start:
-        text = text[start : end + 1]
-    return json.loads(text)
+For employee_count: if you cannot find a reliable headcount from a credible source, return null rather than guessing.
+For industry: a short phrase (<= 12 words) describing what the company does.
+Set the boolean flags accurately — only true if clearly applicable."""
 
 
-def enrich_company(company: str, api_key: str) -> dict | None:
-    payload = {
-        "model": PERPLEXITY_MODEL,
-        "messages": [
-            {"role": "user", "content": ENRICH_PROMPT.format(company=company)}
-        ],
-    }
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
+def enrich_company(client: anthropic.Anthropic, company: str) -> dict | None:
+    messages = [
+        {"role": "user", "content": ENRICH_PROMPT.format(company=company)}
+    ]
 
-    backoff = PERPLEXITY_INITIAL_BACKOFF
-    for attempt in range(PERPLEXITY_MAX_RETRIES + 1):
+    # One continuation in case the server-side tool loop hits pause_turn.
+    for _ in range(2):
         try:
-            r = requests.post(
-                PERPLEXITY_URL,
-                json=payload,
-                headers=headers,
-                timeout=PERPLEXITY_TIMEOUT,
+            response = client.messages.create(
+                model=CLAUDE_MODEL,
+                max_tokens=CLAUDE_MAX_TOKENS,
+                messages=messages,
+                tools=[{"type": WEB_SEARCH_TOOL_VERSION, "name": "web_search"}],
+                output_config={
+                    "format": {"type": "json_schema", "schema": ENRICH_SCHEMA}
+                },
             )
         except Exception as e:
             print(f"  enrich failed for {company!r}: {e}")
             return None
 
-        if r.status_code == 429:
-            if attempt < PERPLEXITY_MAX_RETRIES:
-                print(f"  429 for {company!r}, backing off {backoff}s (retry {attempt + 1}/{PERPLEXITY_MAX_RETRIES})")
-                time.sleep(backoff)
-                backoff *= 2
-                continue
-            print(f"  enrich failed for {company!r}: 429 after {PERPLEXITY_MAX_RETRIES} retries")
+        if response.stop_reason == "pause_turn":
+            messages = [
+                messages[0],
+                {"role": "assistant", "content": response.content},
+            ]
+            continue
+
+        if response.stop_reason == "refusal":
+            print(f"  enrich refused for {company!r}")
+            return None
+
+        text = next(
+            (b.text for b in response.content if b.type == "text"), None
+        )
+        if not text:
+            print(f"  enrich failed for {company!r}: no text block in response")
             return None
 
         try:
-            r.raise_for_status()
-            content = r.json()["choices"][0]["message"]["content"]
-            return _parse_enrichment_json(content)
-        except Exception as e:
+            return json.loads(text)
+        except json.JSONDecodeError as e:
             print(f"  enrich failed for {company!r}: {e}")
             return None
 
+    print(f"  enrich failed for {company!r}: pause_turn not resolved")
     return None
 
 
 def enrich_all(df: pd.DataFrame) -> pd.DataFrame:
-    api_key = os.environ["PERPLEXITY_API_KEY"]
+    client = anthropic.Anthropic(max_retries=CLAUDE_MAX_RETRIES)
     total = len(df)
     enrichments = []
     for i, company in enumerate(df["company"], 1):
         print(f"Enriching {i}/{total}: {company}")
-        enrichments.append(enrich_company(company, api_key))
-        if i < total:
-            time.sleep(PERPLEXITY_REQUEST_SPACING)
+        enrichments.append(enrich_company(client, company))
     df = df.copy()
     df["_enrichment"] = enrichments
     return df
