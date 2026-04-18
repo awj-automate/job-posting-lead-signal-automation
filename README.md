@@ -1,12 +1,12 @@
 # job-posting-lead-signal-automation
 
-Scrapes US job postings from the last 24h across LinkedIn, Indeed, Glassdoor,
-ZipRecruiter, and Google Jobs for a fixed set of data/AI roles, dedupes by
-company, and appends the raw results to a Google Sheet.
+Scrapes US job postings from the last 24h across LinkedIn, Indeed, and
+ZipRecruiter for a fixed set of data/AI roles, dedupes by company, enriches
+each company via Perplexity for employee count + industry, filters out
+staffing/nonprofit/educational/job-platform companies and anything over 50
+employees (or unknown size), and appends the survivors to a Google Sheet.
 
-Designed to run as a weekday-morning cron job on Railway. Enrichment
-(Perplexity company lookup) and filtering (staffing, employee count) are not
-yet implemented — this stage only delivers the raw scrape.
+Designed to run as a weekday-morning cron job on Railway.
 
 ## Roles
 
@@ -21,7 +21,7 @@ yet implemented — this stage only delivers the raw scrape.
 
 Appended to the configured Google Sheet:
 
-`run_timestamp_utc, job_title, job_url, company, date_posted, company_url, location, source`
+`run_timestamp_utc, job_title, job_url, company, company_url, location, source, employee_count, industry`
 
 ## Local run
 
@@ -50,6 +50,6 @@ append only — existing rows are never touched.
 1. Push this repo to GitHub.
 2. On Railway: **New Project → Deploy from GitHub repo** → select this repo.
 3. In **Variables**, set `GOOGLE_SERVICE_ACCOUNT_JSON`, `GOOGLE_SHEET_ID`,
-   and optionally `GOOGLE_WORKSHEET_NAME`.
+   `PERPLEXITY_API_KEY`, and optionally `GOOGLE_WORKSHEET_NAME`.
 4. In **Settings → Cron Schedule**, set your weekday-morning schedule.
 5. Deploy.
