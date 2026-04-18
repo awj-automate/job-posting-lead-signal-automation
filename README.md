@@ -1,7 +1,7 @@
 # job-posting-lead-signal-automation
 
-Scrapes US job postings from the last 24h across LinkedIn, Indeed, and
-ZipRecruiter for a fixed set of data/AI roles, dedupes by company, enriches
+Scrapes US job postings from the last 24h across LinkedIn and Indeed for a
+fixed set of data/AI roles, dedupes by company, enriches
 each company via Perplexity for employee count + industry, filters out
 staffing/nonprofit/educational/job-platform companies and anything over 50
 employees (or unknown size), and appends the survivors to a Google Sheet.

@@ -27,7 +27,7 @@ ROLES = [
     "data consultant",
 ]
 
-SITES = ["linkedin", "indeed", "zip_recruiter"]
+SITES = ["linkedin", "indeed"]
 
 RESULTS_PER_ROLE = 50
 HOURS_OLD = 24
