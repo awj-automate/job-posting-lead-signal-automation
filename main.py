@@ -3,21 +3,27 @@ Scrape US job postings from the last 24h across multiple boards for a fixed
 set of roles, dedupe by company, enrich each company via Claude Haiku 4.5
 (with server-side web search) for employee count + industry, drop
 staffing/nonprofit/educational/job-platform companies and anything over 50
-employees (or unknown size), then append the survivors to a Google Sheet.
+employees (or unknown size), then persist survivors + historical job data to
+Neon Postgres.
 
-A second "raw" sheet caches every company's lookup result across runs so
-repeat companies skip the Claude call.
+Each invocation writes a row to the `runs` table wrapping the whole thing,
+so failures are auditable.
 """
 
 import json
-import os
-from datetime import datetime, timezone
+import re
+import time
+import traceback
 
 import anthropic
 import pandas as pd
 from jobspy import scrape_jobs
 
-from sheets import SheetClient, fuzzy_find, normalize_company
+import contacts
+import db
+import instantly
+from backfill import run_backfill
+from matcher import fuzzy_find, normalize_company
 
 
 ROLES = [
@@ -39,6 +45,11 @@ CLAUDE_MODEL = "claude-haiku-4-5"
 CLAUDE_MAX_TOKENS = 1024
 CLAUDE_MAX_RETRIES = 4
 WEB_SEARCH_TOOL_VERSION = "web_search_20250305"
+
+# Cap per-run contact discovery to protect against a large backlog after
+# backfill. Can raise this once the queue is drained.
+MAX_CONTACT_DISCOVERIES_PER_RUN = 50
+CONTACT_DISCOVERY_SLEEP_SECONDS = 2.0
 
 
 def scrape_all() -> pd.DataFrame:
@@ -71,8 +82,7 @@ def scrape_all() -> pd.DataFrame:
 
 
 def dedupe_by_company(df: pd.DataFrame) -> pd.DataFrame:
-    """Fuzzy-dedupe within a run so near-duplicates ("Acme Inc" vs "Acme")
-    don't both flow through to lookup."""
+    """Fuzzy-dedupe within a run so near-duplicates don't both reach lookup."""
     df = df.copy()
     df["company"] = df["company"].fillna("").astype(str).str.strip()
     df = df[df["company"] != ""]
@@ -100,26 +110,19 @@ ENRICH_SCHEMA = {
             "type": "string",
             "description": "Short phrase (<= 12 words) describing what the company does.",
         },
-        "is_staffing": {
-            "type": "boolean",
-            "description": "True if staffing agency, recruiting firm, RPO, or headhunter.",
+        "domain": {
+            "type": ["string", "null"],
+            "description": "Primary company website domain, e.g. 'example.com'.",
         },
-        "is_nonprofit": {
-            "type": "boolean",
-            "description": "True if nonprofit, NGO, foundation, or charity.",
-        },
-        "is_educational": {
-            "type": "boolean",
-            "description": "True if K-12 school, university, college, or educational institution.",
-        },
-        "is_job_platform": {
-            "type": "boolean",
-            "description": "True if job board, job aggregator, or job-posting platform.",
-        },
+        "is_staffing": {"type": "boolean"},
+        "is_nonprofit": {"type": "boolean"},
+        "is_educational": {"type": "boolean"},
+        "is_job_platform": {"type": "boolean"},
     },
     "required": [
         "employee_count",
         "industry",
+        "domain",
         "is_staffing",
         "is_nonprofit",
         "is_educational",
@@ -132,13 +135,12 @@ ENRICH_PROMPT = """Look up the US-based company "{company}" using web search and
 
 For employee_count: if you cannot find a reliable headcount from a credible source, return null rather than guessing.
 For industry: a short phrase (<= 12 words) describing what the company does.
+For domain: the company's primary website domain (e.g., "example.com") without protocol or "www.". Do NOT return a job board domain like linkedin.com or indeed.com. Return null if uncertain.
 Set the boolean flags accurately — only true if clearly applicable."""
 
 
 def enrich_company(client: anthropic.Anthropic, company: str) -> dict | None:
-    messages = [
-        {"role": "user", "content": ENRICH_PROMPT.format(company=company)}
-    ]
+    messages = [{"role": "user", "content": ENRICH_PROMPT.format(company=company)}]
 
     # One continuation in case the server-side tool loop hits pause_turn.
     for _ in range(2):
@@ -184,24 +186,28 @@ def enrich_company(client: anthropic.Anthropic, company: str) -> dict | None:
     return None
 
 
-def _keep_enrichment(e: dict | None) -> bool:
+def _classify_enrichment(e: dict | None) -> tuple[str | None, str | None]:
+    """(passed_lookup, rejection_reason). passed_lookup=None means lookup
+    itself failed and should be retried next run."""
     if not e:
-        return False
+        return None, None
     count = e.get("employee_count")
-    if count is None or not isinstance(count, int) or count > MAX_EMPLOYEES:
-        return False
-    if (
-        e.get("is_staffing")
-        or e.get("is_nonprofit")
-        or e.get("is_educational")
-        or e.get("is_job_platform")
+    if count is None or not isinstance(count, int):
+        return "no", "size_unknown"
+    if count > MAX_EMPLOYEES:
+        return "no", "too_large"
+    for flag, reason in (
+        ("is_staffing", "staffing"),
+        ("is_nonprofit", "nonprofit"),
+        ("is_educational", "educational"),
+        ("is_job_platform", "job_platform"),
     ):
-        return False
-    return True
+        if e.get(flag):
+            return "no", reason
+    return "yes", None
 
 
 def _s(v) -> str:
-    """Safe string cast: None/NaN -> ""."""
     if v is None:
         return ""
     try:
@@ -212,134 +218,163 @@ def _s(v) -> str:
     return str(v)
 
 
-def _job_row(
-    run_ts: str, job: pd.Series, employee_count: str, industry: str
-) -> list[str]:
-    """Shape a scraped job row into the SHEET_COLUMNS tuple."""
-    return [
-        run_ts,
-        _s(job.get("title")),
-        _s(job.get("job_url")),
-        _s(job.get("company")),
-        _s(job.get("company_url")),
-        _s(job.get("location")),
-        _s(job.get("site")),
-        _s(employee_count),
-        _s(industry),
-    ]
+def _domain_from_url(url: str) -> str | None:
+    if not url:
+        return None
+    m = re.search(r"https?://([^/?#]+)", url)
+    if not m:
+        return None
+    host = m.group(1).lower()
+    return host[4:] if host.startswith("www.") else host
 
 
 def main() -> None:
-    df = scrape_all()
-    if df.empty:
-        print("No jobs scraped; nothing to upload.")
-        return
-    print(f"Scraped {len(df)} rows before dedupe")
+    conn = db.connect()
+    db.init_schema(conn)
 
-    df = dedupe_by_company(df)
-    print(f"{len(df)} companies after within-run dedupe")
-    if df.empty:
-        return
+    if db.companies_empty(conn):
+        print("Companies table empty — running one-shot backfill from Sheets.")
+        run_backfill(conn)
 
-    sheets = SheetClient()
-    output_keys = sheets.load_output_company_keys()
-    raw_cache = sheets.load_raw_cache()
-    print(
-        f"Cache: {len(raw_cache)} raw rows, "
-        f"{len(output_keys)} companies already in output"
-    )
+    run_id = db.start_run(conn)
+    print(f"Starting run {run_id}")
+    try:
+        df = scrape_all()
+        if df.empty:
+            print("No jobs scraped.")
+            db.finish_run(conn, run_id, jobs_scraped=0)
+            return
+        scraped_count = len(df)
+        print(f"Scraped {scraped_count} rows before dedupe")
 
-    run_ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        df = dedupe_by_company(df)
+        print(f"{len(df)} companies after within-run dedupe")
+        if df.empty:
+            db.finish_run(conn, run_id, jobs_scraped=0)
+            return
 
-    # Classify each scraped company.
-    # - cached_pass: already Yes in raw cache, include in output
-    # - needs_lookup: (job, existing_row_index_or_None) — run Claude, then update raw
-    # - new_raw_rows: blank raw rows to append for never-seen companies
-    cached_pass: list[tuple[pd.Series, str, str]] = []
-    needs_lookup: list[tuple[pd.Series, int | None]] = []
-    new_raw_rows: list[list[str]] = []
+        cache = db.load_companies(conn)
+        cache_keys = list(cache.keys())
+        print(f"Loaded {len(cache)} companies from DB")
 
-    raw_keys = list(raw_cache.keys())
-    for _, job in df.iterrows():
-        key = normalize_company(_s(job.get("company")))
-        if not key:
-            continue
-        match_key = fuzzy_find(key, raw_keys)
-        if match_key is not None:
-            cached = raw_cache[match_key]
-            passed = cached.passed_lookup.strip().lower()
-            if passed == "yes":
-                cached_pass.append((job, cached.employee_count, cached.industry))
-            elif passed == "no":
-                pass  # excluded by prior lookup
+        # (company_id, job_row, needs_lookup) — needs_lookup skipped when
+        # the company is already cached yes or no.
+        entries: list[tuple[int, pd.Series, bool]] = []
+        companies_new = 0
+        companies_cached_yes = 0
+        companies_cached_no = 0
+
+        for _, job in df.iterrows():
+            name = _s(job.get("company"))
+            key = normalize_company(name)
+            if not key:
+                continue
+            match = fuzzy_find(key, cache_keys)
+            if match is not None:
+                c = cache[match]
+                passed = (c.passed_lookup or "").lower()
+                if passed == "yes":
+                    companies_cached_yes += 1
+                    entries.append((c.id, job, False))
+                elif passed == "no":
+                    companies_cached_no += 1
+                    entries.append((c.id, job, False))
+                else:
+                    entries.append((c.id, job, True))
             else:
-                # Row exists but lookup never completed — retry, reuse row.
-                needs_lookup.append((job, cached.row_index))
-        else:
-            needs_lookup.append((job, None))
-            new_raw_rows.append(_job_row(run_ts, job, "", "") + [""])
+                cid = db.upsert_company(
+                    conn, name, key, _domain_from_url(_s(job.get("company_url")))
+                )
+                cache[key] = db.Company(
+                    id=cid,
+                    name=name,
+                    normalized_key=key,
+                    domain=_domain_from_url(_s(job.get("company_url"))),
+                    employee_count=None,
+                    industry=None,
+                    passed_lookup=None,
+                    rejection_reason=None,
+                )
+                cache_keys.append(key)
+                companies_new += 1
+                entries.append((cid, job, True))
 
-    print(
-        f"Classification: {len(cached_pass)} cached-pass, "
-        f"{len(needs_lookup)} need lookup "
-        f"({len(new_raw_rows)} new to raw sheet)"
-    )
-
-    # Append new raw rows and bind their row indices to needs_lookup entries.
-    if new_raw_rows:
-        new_row_indices = sheets.append_raw_rows(new_raw_rows)
-        it = iter(new_row_indices)
-        needs_lookup = [
-            (job, ri if ri is not None else next(it))
-            for job, ri in needs_lookup
-        ]
-
-    # Enrich — the only step that calls Claude.
-    client = anthropic.Anthropic(max_retries=CLAUDE_MAX_RETRIES)
-    lookup_results: list[tuple[pd.Series, int, dict | None]] = []
-    for i, (job, row_idx) in enumerate(needs_lookup, 1):
-        company = _s(job.get("company"))
-        print(f"Enriching {i}/{len(needs_lookup)}: {company}")
-        lookup_results.append((job, row_idx, enrich_company(client, company)))
-
-    # Write enrichment results back to the raw sheet. Failed lookups (None)
-    # stay blank so the next run retries them.
-    raw_updates = []
-    for job, row_idx, e in lookup_results:
-        if e is None:
-            continue
-        passed = "Yes" if _keep_enrichment(e) else "No"
-        emp = e.get("employee_count")
-        emp_str = str(emp) if isinstance(emp, int) else ""
-        raw_updates.append((row_idx, passed, emp_str, _s(e.get("industry"))))
-    sheets.update_raw_lookups(raw_updates)
-
-    # Build output rows: cached passes + newly-passed lookups,
-    # skipping any company already present in the output sheet.
-    output_rows: list[list[str]] = []
-    for job, emp, ind in cached_pass:
-        key = normalize_company(_s(job.get("company")))
-        if fuzzy_find(key, output_keys) is not None:
-            continue
-        output_rows.append(_job_row(run_ts, job, emp, ind))
-        output_keys.add(key)
-
-    for job, _row_idx, e in lookup_results:
-        if not _keep_enrichment(e):
-            continue
-        key = normalize_company(_s(job.get("company")))
-        if fuzzy_find(key, output_keys) is not None:
-            continue
-        output_rows.append(
-            _job_row(run_ts, job, str(e["employee_count"]), _s(e.get("industry")))
+        # Record every scraped job (regardless of company status) for history.
+        db.insert_jobs(
+            conn,
+            [
+                (
+                    cid,
+                    _s(job.get("title")) or None,
+                    _s(job.get("job_url")) or None,
+                    _s(job.get("location")) or None,
+                    _s(job.get("site")) or None,
+                    _s(job.get("search_role")) or None,
+                )
+                for cid, job, _ in entries
+            ],
         )
-        output_keys.add(key)
 
-    if not output_rows:
-        print("Nothing new to append to output sheet.")
-        return
-    sheets.append_output_rows(output_rows)
-    print(f"Appended {len(output_rows)} rows to output sheet")
+        # Enrich distinct pending companies.
+        pending: list[tuple[int, str]] = []
+        seen_ids: set[int] = set()
+        for cid, job, needs in entries:
+            if not needs or cid in seen_ids:
+                continue
+            seen_ids.add(cid)
+            pending.append((cid, _s(job.get("company"))))
+
+        print(f"Enriching {len(pending)} companies")
+        client = anthropic.Anthropic(max_retries=CLAUDE_MAX_RETRIES)
+        for i, (cid, name) in enumerate(pending, 1):
+            print(f"Enriching {i}/{len(pending)}: {name}")
+            e = enrich_company(client, name)
+            passed, reason = _classify_enrichment(e)
+            if passed is None:
+                continue  # lookup failed — leave null, retry next run
+            db.update_company_lookup(
+                conn,
+                cid,
+                passed,
+                e.get("employee_count") if isinstance(e.get("employee_count"), int) else None,
+                e.get("industry") or None,
+                reason,
+                domain=e.get("domain") or None,
+            )
+
+        # Phase 2: find + verify contacts for passing companies that haven't
+        # been through contact discovery yet.
+        contacts_found = 0
+        pending_contacts = db.load_companies_pending_contacts(
+            conn, MAX_CONTACT_DISCOVERIES_PER_RUN
+        )
+        print(f"Contact discovery: {len(pending_contacts)} companies to process")
+        for i, c in enumerate(pending_contacts, 1):
+            print(f"[{i}/{len(pending_contacts)}] {c.name}")
+            contacts_found += contacts.discover_for_company(
+                conn, c.id, c.name, c.domain, client,
+            )
+            if i < len(pending_contacts):
+                time.sleep(CONTACT_DISCOVERY_SLEEP_SECONDS)
+
+        # Phase 3: push verified unsynced contacts to Instantly.
+        contacts_synced = instantly.sync_unsynced(conn)
+
+        db.finish_run(
+            conn,
+            run_id,
+            jobs_scraped=scraped_count,
+            companies_new=companies_new,
+            companies_cached_yes=companies_cached_yes,
+            companies_cached_no=companies_cached_no,
+            contacts_found=contacts_found,
+            contacts_verified_ok=contacts_found,
+            contacts_synced_to_instantly=contacts_synced,
+        )
+        print(f"Run {run_id} complete")
+    except Exception:
+        db.record_run_error(conn, run_id, traceback.format_exc())
+        raise
 
 
 if __name__ == "__main__":
