@@ -16,8 +16,8 @@ once per company.
 import json
 import os
 import re
-import time
 import unicodedata
+from concurrent.futures import ThreadPoolExecutor
 
 import anthropic
 import requests
@@ -32,7 +32,6 @@ WEB_SEARCH_TOOL_VERSION = "web_search_20250305"
 MV_ENDPOINT = "https://api.millionverifier.com/api/v3/"
 MV_TIMEOUT_SECONDS = 10
 MV_HTTP_TIMEOUT = 20
-MV_SLEEP_BETWEEN_CALLS = 0.2
 
 AMF_ENDPOINT = "https://api.anymailfinder.com/v5.1/find-email/decision-maker"
 AMF_HTTP_TIMEOUT = 200
@@ -155,10 +154,15 @@ def _verify_mv(email: str) -> str:
 
 
 def _try_patterns(first: str, last: str, domain: str) -> str | None:
-    """Try each pattern in order until one verifies as 'ok'."""
-    for email in generate_patterns(first, last, domain):
-        status = _verify_mv(email)
-        time.sleep(MV_SLEEP_BETWEEN_CALLS)
+    """Verify all candidate patterns in parallel; return the first 'ok' in
+    pattern-priority order. MV has no stated rate limits on the single-email
+    API, so 8 concurrent requests is fine."""
+    candidates = generate_patterns(first, last, domain)
+    if not candidates:
+        return None
+    with ThreadPoolExecutor(max_workers=len(candidates)) as pool:
+        statuses = list(pool.map(_verify_mv, candidates))
+    for email, status in zip(candidates, statuses):
         if status == "ok":
             return email
     return None
