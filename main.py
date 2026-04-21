@@ -22,7 +22,6 @@ from jobspy import scrape_jobs
 import contacts
 import db
 import instantly
-from backfill import run_backfill
 from matcher import fuzzy_find, normalize_company
 
 
@@ -46,8 +45,7 @@ CLAUDE_MAX_TOKENS = 1024
 CLAUDE_MAX_RETRIES = 4
 WEB_SEARCH_TOOL_VERSION = "web_search_20250305"
 
-# Cap per-run contact discovery to protect against a large backlog after
-# backfill. Can raise this once the queue is drained.
+# Cap per-run contact discovery to keep runs bounded.
 MAX_CONTACT_DISCOVERIES_PER_RUN = 50
 CONTACT_DISCOVERY_SLEEP_SECONDS = 2.0
 
@@ -231,10 +229,6 @@ def _domain_from_url(url: str) -> str | None:
 def main() -> None:
     conn = db.connect()
     db.init_schema(conn)
-
-    if db.companies_empty(conn):
-        print("Companies table empty — running one-shot backfill from Sheets.")
-        run_backfill(conn)
 
     run_id = db.start_run(conn)
     print(f"Starting run {run_id}")

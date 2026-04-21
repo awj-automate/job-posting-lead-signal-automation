@@ -40,22 +40,19 @@ Schema lives in `schema.sql` and is applied idempotently on every startup.
 ## Flow
 
 1. Apply schema (no-op if tables already exist).
-2. If the `companies` table is empty and Sheets env vars are still set, run
-   the one-shot backfill from the legacy Sheets storage.
-3. Scrape → within-run fuzzy dedupe.
-4. Load the companies cache from Neon. Classify each scraped row:
+2. Scrape → within-run fuzzy dedupe.
+3. Load the companies cache from Neon. Classify each scraped row:
    - cached `yes` or `no` → record the job, skip enrichment.
    - cached `null` (lookup pending) or new company → queue for enrichment.
-5. Enrich the queued companies via Claude. Update their rows with
+4. Enrich the queued companies via Claude. Update their rows with
    `passed_lookup`, a rejection reason where applicable, and domain.
-6. For each passing company whose `contacts_discovered_at` is null, run the
-   contact discovery pass (capped at 50/run to stay friendly after backfill):
-   Claude finds up to 3 C-level candidates, patterns get verified with
-   MillionVerifier, and AnyMailFinder decision-maker is the fallback when
-   the cheap path returns zero.
-7. Push all `ok`-verified contacts with `synced_to_instantly_at IS NULL`
+5. For each passing company whose `contacts_discovered_at` is null, run the
+   contact discovery pass (capped at 50/run): Claude finds up to 3 C-level
+   candidates, patterns get verified with MillionVerifier, and AnyMailFinder
+   decision-maker is the fallback when the cheap path returns zero.
+6. Push all `ok`-verified contacts with `synced_to_instantly_at IS NULL`
    to the Instantly campaign in batches of 1000.
-8. Record counts + `finished_at` on the `runs` row.
+7. Record counts + `finished_at` on the `runs` row.
 
 ### Cost per new passing company (rough)
 
@@ -72,19 +69,6 @@ Schema lives in `schema.sql` and is applied idempotently on every startup.
 Not supported — this project runs on Railway. Local development would require
 Neon creds and scraping rate-limits that aren't worth working around.
 
-## One-time migration
-
-Set both `DATABASE_URL` (Neon) and the legacy Sheets env vars on Railway. On
-first deploy:
-
-1. Schema is created in Neon.
-2. Backfill reads both sheets, merges by normalized company key, and
-   populates `companies` + `jobs`.
-3. Normal run proceeds.
-
-After the first successful run, delete the Sheets env vars from Railway. The
-backfill only runs while `companies` is empty, so it won't re-run.
-
 ## Env vars
 
 | Var | Purpose |
@@ -95,10 +79,6 @@ backfill only runs while `companies` is empty, so it won't re-run.
 | `ANYMAILFINDER_API_KEY` | Decision-maker fallback when patterns fail. |
 | `INSTANTLY_API_KEY` | Push verified contacts to an Instantly campaign. |
 | `INSTANTLY_CAMPAIGN_ID` | The campaign UUID to sync contacts into. |
-| `GOOGLE_SERVICE_ACCOUNT_JSON` | Legacy — Sheets backfill only. |
-| `GOOGLE_SHEET_ID` | Legacy — backfill only. |
-| `RAW_SHEET_ID` | Legacy — backfill only. |
-| `GOOGLE_WORKSHEET_NAME` / `RAW_WORKSHEET_NAME` | Optional, default `Sheet1`. |
 
 ## Railway deploy
 
@@ -108,5 +88,4 @@ backfill only runs while `companies` is empty, so it won't re-run.
    grab the pooled connection string, set it as `DATABASE_URL`.
 4. Set remaining variables (see table above).
 5. In **Settings → Cron Schedule**, set your weekday-morning schedule.
-6. Deploy. Watch the first run's logs to confirm schema creation + backfill.
-7. Once verified in Neon, remove the Sheets env vars.
+6. Deploy.

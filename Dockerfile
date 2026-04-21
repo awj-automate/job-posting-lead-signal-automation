@@ -7,6 +7,6 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY main.py db.py matcher.py backfill.py contacts.py instantly.py sheets.py schema.sql ./
+COPY main.py db.py matcher.py contacts.py instantly.py schema.sql ./
 
 CMD ["python", "main.py"]

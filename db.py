@@ -51,12 +51,6 @@ def init_schema(conn: psycopg.Connection) -> None:
             cur.execute(stmt)
 
 
-def companies_empty(conn: psycopg.Connection) -> bool:
-    with conn.cursor() as cur:
-        cur.execute("SELECT 1 FROM companies LIMIT 1")
-        return cur.fetchone() is None
-
-
 def load_companies(conn: psycopg.Connection) -> dict[str, Company]:
     """Whole companies table keyed by normalized_key."""
     with conn.cursor(row_factory=dict_row) as cur:
