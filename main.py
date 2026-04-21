@@ -49,6 +49,12 @@ WEB_SEARCH_TOOL_VERSION = "web_search_20250305"
 MAX_CONTACT_DISCOVERIES_PER_RUN = 50
 CONTACT_DISCOVERY_SLEEP_SECONDS = 2.0
 
+# When True, the pipeline stops after the classification step: no company
+# upserts, no Claude enrichment, no contact discovery, no Instantly sync.
+# Just scrape + dedupe + look everything up against the DB cache and log
+# how many rows each bucket would have produced.
+DRY_RUN = True
+
 
 def scrape_all() -> pd.DataFrame:
     frames = []
@@ -230,13 +236,18 @@ def main() -> None:
     conn = db.connect()
     db.init_schema(conn)
 
-    run_id = db.start_run(conn)
-    print(f"Starting run {run_id}")
+    if DRY_RUN:
+        print("*** DRY RUN — no DB writes, no API calls past the scrape ***")
+        run_id = None
+    else:
+        run_id = db.start_run(conn)
+        print(f"Starting run {run_id}")
     try:
         df = scrape_all()
         if df.empty:
             print("No jobs scraped.")
-            db.finish_run(conn, run_id, jobs_scraped=0)
+            if not DRY_RUN:
+                db.finish_run(conn, run_id, jobs_scraped=0)
             return
         scraped_count = len(df)
         print(f"Scraped {scraped_count} rows before dedupe")
@@ -244,7 +255,8 @@ def main() -> None:
         df = dedupe_by_company(df)
         print(f"{len(df)} companies after within-run dedupe")
         if df.empty:
-            db.finish_run(conn, run_id, jobs_scraped=0)
+            if not DRY_RUN:
+                db.finish_run(conn, run_id, jobs_scraped=0)
             return
 
         cache = db.load_companies(conn)
@@ -257,6 +269,7 @@ def main() -> None:
         companies_new = 0
         companies_cached_yes = 0
         companies_cached_no = 0
+        companies_pending_lookup = 0
 
         for _, job in df.iterrows():
             name = _s(job.get("company"))
@@ -269,29 +282,50 @@ def main() -> None:
                 passed = (c.passed_lookup or "").lower()
                 if passed == "yes":
                     companies_cached_yes += 1
-                    entries.append((c.id, job, False))
+                    if not DRY_RUN:
+                        entries.append((c.id, job, False))
                 elif passed == "no":
                     companies_cached_no += 1
-                    entries.append((c.id, job, False))
+                    if not DRY_RUN:
+                        entries.append((c.id, job, False))
                 else:
-                    entries.append((c.id, job, True))
+                    companies_pending_lookup += 1
+                    if not DRY_RUN:
+                        entries.append((c.id, job, True))
             else:
-                cid = db.upsert_company(
-                    conn, name, key, _domain_from_url(_s(job.get("company_url")))
-                )
-                cache[key] = db.Company(
-                    id=cid,
-                    name=name,
-                    normalized_key=key,
-                    domain=_domain_from_url(_s(job.get("company_url"))),
-                    employee_count=None,
-                    industry=None,
-                    passed_lookup=None,
-                    rejection_reason=None,
-                )
-                cache_keys.append(key)
                 companies_new += 1
-                entries.append((cid, job, True))
+                if not DRY_RUN:
+                    cid = db.upsert_company(
+                        conn, name, key, _domain_from_url(_s(job.get("company_url")))
+                    )
+                    cache[key] = db.Company(
+                        id=cid,
+                        name=name,
+                        normalized_key=key,
+                        domain=_domain_from_url(_s(job.get("company_url"))),
+                        employee_count=None,
+                        industry=None,
+                        passed_lookup=None,
+                        rejection_reason=None,
+                    )
+                    cache_keys.append(key)
+                    entries.append((cid, job, True))
+
+        would_enrich = companies_new + companies_pending_lookup
+        print(
+            "\n=== Classification summary ===\n"
+            f"  Scraped (pre-dedupe):                     {scraped_count}\n"
+            f"  After within-run dedupe:                  {len(df)}\n"
+            f"  Already cached Yes (would skip enrich):   {companies_cached_yes}\n"
+            f"  Already cached No  (would skip enrich):   {companies_cached_no}\n"
+            f"  Known to DB but lookup pending (retry):   {companies_pending_lookup}\n"
+            f"  Never seen before (would insert+enrich):  {companies_new}\n"
+            f"  => WOULD ENRICH NEXT:                     {would_enrich} companies\n"
+        )
+
+        if DRY_RUN:
+            print("Dry run complete — exiting before any writes.")
+            return
 
         # Record every scraped job (regardless of company status) for history.
         db.insert_jobs(
@@ -367,7 +401,8 @@ def main() -> None:
         )
         print(f"Run {run_id} complete")
     except Exception:
-        db.record_run_error(conn, run_id, traceback.format_exc())
+        if run_id is not None:
+            db.record_run_error(conn, run_id, traceback.format_exc())
         raise
 
 
