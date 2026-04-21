@@ -12,6 +12,7 @@ so failures are auditable.
 
 import json
 import re
+import time
 import traceback
 
 import anthropic
@@ -46,6 +47,7 @@ WEB_SEARCH_TOOL_VERSION = "web_search_20250305"
 
 # Cap per-run contact discovery to keep runs bounded.
 MAX_CONTACT_DISCOVERIES_PER_RUN = 50
+CONTACT_DISCOVERY_SLEEP_SECONDS = 0.5
 
 # When True, the pipeline stops after the classification step: no company
 # upserts, no Claude enrichment, no contact discovery, no Instantly sync.
@@ -380,6 +382,8 @@ def main() -> None:
             contacts_found += contacts.discover_for_company(
                 conn, c.id, c.name, c.domain, client,
             )
+            if i < len(pending_contacts):
+                time.sleep(CONTACT_DISCOVERY_SLEEP_SECONDS)
 
         # Phase 3: push verified unsynced contacts to Instantly.
         contacts_synced = instantly.sync_unsynced(conn)
