@@ -63,14 +63,23 @@ def _derive_domain(company_url: str) -> str | None:
     return host[4:] if host.startswith("www.") else host
 
 
-def _rows_from_sheet(ws) -> list[dict]:
+def _norm_header(s: str) -> str:
+    """Normalize a header so 'Company', 'company', 'Passed lookup?' and
+    'passed_lookup' all compare equal."""
+    return re.sub(r"[^a-z0-9]+", "_", (s or "").lower().strip()).strip("_")
+
+
+def _rows_from_sheet(ws, label: str) -> list[dict]:
     values = ws.get_all_values()
     if len(values) < 2:
+        print(f"Backfill[{label}]: sheet has no data rows.")
         return []
-    idx = {c: i for i, c in enumerate(values[0])}
+    header = values[0]
+    print(f"Backfill[{label}]: headers = {header!r}")
+    idx = {_norm_header(c): i for i, c in enumerate(header)}
 
     def cell(row, col):
-        j = idx.get(col)
+        j = idx.get(_norm_header(col))
         return row[j].strip() if j is not None and j < len(row) else ""
 
     return [
@@ -123,8 +132,12 @@ def run_backfill(conn: psycopg.Connection) -> None:
         return
 
     print("Backfill: reading sheets...")
-    raw_rows = _rows_from_sheet(_open_ws("RAW_SHEET_ID", "RAW_WORKSHEET_NAME"))
-    out_rows = _rows_from_sheet(_open_ws("GOOGLE_SHEET_ID", "GOOGLE_WORKSHEET_NAME"))
+    raw_rows = _rows_from_sheet(
+        _open_ws("RAW_SHEET_ID", "RAW_WORKSHEET_NAME"), "raw"
+    )
+    out_rows = _rows_from_sheet(
+        _open_ws("GOOGLE_SHEET_ID", "GOOGLE_WORKSHEET_NAME"), "output"
+    )
     for r in out_rows:
         r["passed_lookup"] = "yes"  # output sheet only ever held passers
     print(f"Backfill: {len(raw_rows)} raw rows, {len(out_rows)} output rows")
