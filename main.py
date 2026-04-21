@@ -53,7 +53,7 @@ CONTACT_DISCOVERY_SLEEP_SECONDS = 2.0
 # upserts, no Claude enrichment, no contact discovery, no Instantly sync.
 # Just scrape + dedupe + look everything up against the DB cache and log
 # how many rows each bucket would have produced.
-DRY_RUN = True
+DRY_RUN = False
 
 
 def scrape_all() -> pd.DataFrame:
