@@ -95,6 +95,9 @@ def update_company_lookup(
     rejection_reason: str | None = None,
     domain: str | None = None,
 ) -> None:
+    """Claude's enrichment is more authoritative than whatever was on the
+    row before, so a freshly-discovered domain wins. Pass NULL to keep
+    the existing value."""
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -103,7 +106,7 @@ def update_company_lookup(
                 employee_count    = %s,
                 industry          = %s,
                 rejection_reason  = %s,
-                domain            = COALESCE(domain, %s),
+                domain            = COALESCE(%s, domain),
                 last_looked_up_at = NOW()
             WHERE id = %s
             """,

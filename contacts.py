@@ -50,20 +50,14 @@ def _amf_decision_maker(
     """Call AMF decision-maker. Returns contact dict or None.
 
     Tries categories in priority order (AMF picks the first that resolves
-    to a valid email — we only pay 2 credits when one does).
-
-    AMF accepts either `domain` or `company_name`. Per their docs, if you
-    pass a company name in the `domain` field they'll try to resolve it
-    themselves, which works better in practice than the `company_name`
-    field. So we always send via `domain`: the real domain when we have a
-    clean one, otherwise the company name as a domain-resolution hint."""
+    to a valid email — we only pay 2 credits when one does)."""
     payload = {
         "decision_maker_category": ["ceo", "operations", "marketing"],
     }
     if is_valid_company_domain(domain):
         payload["domain"] = domain
     elif company_name:
-        payload["domain"] = company_name
+        payload["company_name"] = company_name
     else:
         return None
 

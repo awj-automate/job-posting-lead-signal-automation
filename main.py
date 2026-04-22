@@ -22,6 +22,7 @@ from jobspy import scrape_jobs
 import contacts
 import db
 import instantly
+from contacts import is_valid_company_domain
 from matcher import fuzzy_find, normalize_company
 
 
@@ -65,7 +66,7 @@ DRY_RUN = False
 
 # When True, skip the entire pipeline and just fire canned AMF probes to
 # diagnose 400 errors. Set False to resume normal runs.
-AMF_TEST_MODE = True
+AMF_TEST_MODE = False
 
 
 def scrape_all() -> pd.DataFrame:
@@ -368,14 +369,16 @@ def main() -> None:
             else:
                 companies_new += 1
                 if not DRY_RUN:
-                    cid = db.upsert_company(
-                        conn, name, key, _domain_from_url(_s(job.get("company_url")))
-                    )
+                    # Don't insert a domain from company_url — jobspy almost
+                    # always returns a job-board URL (linkedin / indeed),
+                    # which is useless. Let Claude enrichment provide the
+                    # real domain via web search.
+                    cid = db.upsert_company(conn, name, key, None)
                     cache[key] = db.Company(
                         id=cid,
                         name=name,
                         normalized_key=key,
-                        domain=_domain_from_url(_s(job.get("company_url"))),
+                        domain=None,
                         employee_count=None,
                         industry=None,
                         passed_lookup=None,
@@ -433,6 +436,9 @@ def main() -> None:
             passed, reason = _classify_enrichment(e)
             if passed is None:
                 continue  # lookup failed — leave null, retry next run
+            claude_domain = (e.get("domain") or "").strip().lower() or None
+            if claude_domain and not is_valid_company_domain(claude_domain):
+                claude_domain = None  # discard junk like "linkedin.com"
             db.update_company_lookup(
                 conn,
                 cid,
@@ -440,7 +446,7 @@ def main() -> None:
                 e.get("employee_count") if isinstance(e.get("employee_count"), int) else None,
                 e.get("industry") or None,
                 reason,
-                domain=e.get("domain") or None,
+                domain=claude_domain,
             )
 
         # Phase 2: find + verify contacts for passing companies that haven't
