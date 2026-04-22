@@ -51,9 +51,6 @@ ENRICH_MAX_SEARCHES = 3
 
 CONTACT_DISCOVERY_SLEEP_SECONDS = 0.5
 
-# Cap raw scrape rows per run. Set to None to disable.
-SCRAPE_ROW_LIMIT = 100
-
 
 def scrape_all() -> pd.DataFrame:
     frames = []
@@ -237,15 +234,8 @@ def main() -> None:
             print("No jobs scraped.")
             db.finish_run(conn, run_id, jobs_scraped=0)
             return
-        total_scraped = len(df)
-        print(f"Scraped {total_scraped} rows before dedupe")
-        if SCRAPE_ROW_LIMIT and total_scraped > SCRAPE_ROW_LIMIT:
-            print(
-                f"Capping at first {SCRAPE_ROW_LIMIT} of {total_scraped} rows "
-                f"(dropping {total_scraped - SCRAPE_ROW_LIMIT})"
-            )
-            df = df.head(SCRAPE_ROW_LIMIT)
         scraped_count = len(df)
+        print(f"Scraped {scraped_count} rows before dedupe")
 
         df = dedupe_by_company(df)
         print(f"{len(df)} companies after within-run dedupe")
@@ -306,7 +296,7 @@ def main() -> None:
         to_enrich = companies_new + companies_pending_lookup
         print(
             "\n=== Classification summary ===\n"
-            f"  Scraped (after cap):                      {scraped_count}\n"
+            f"  Scraped:                                  {scraped_count}\n"
             f"  After within-run dedupe:                  {len(df)}\n"
             f"  Already cached Yes (skipping enrich):     {companies_cached_yes}\n"
             f"  Already cached No  (skipping enrich):     {companies_cached_no}\n"
