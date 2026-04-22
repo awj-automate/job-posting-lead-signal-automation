@@ -28,6 +28,9 @@ import db
 CLAUDE_MODEL = "claude-haiku-4-5"
 CLAUDE_MAX_TOKENS = 1024
 WEB_SEARCH_TOOL_VERSION = "web_search_20250305"
+# Cap web searches per Claude call. Without this the model can fire 10+
+# searches and quietly burn $0.10+ per company in search fees alone.
+CONTACT_MAX_SEARCHES = 5
 
 MV_ENDPOINT = "https://api.millionverifier.com/api/v3/"
 MV_TIMEOUT_SECONDS = 10
@@ -172,7 +175,11 @@ def _claude_find_people(
                 model=CLAUDE_MODEL,
                 max_tokens=CLAUDE_MAX_TOKENS,
                 messages=messages,
-                tools=[{"type": WEB_SEARCH_TOOL_VERSION, "name": "web_search"}],
+                tools=[{
+                    "type": WEB_SEARCH_TOOL_VERSION,
+                    "name": "web_search",
+                    "max_uses": CONTACT_MAX_SEARCHES,
+                }],
                 output_config={
                     "format": {"type": "json_schema", "schema": CONTACT_SCHEMA}
                 },

@@ -44,9 +44,13 @@ CLAUDE_MODEL = "claude-haiku-4-5"
 CLAUDE_MAX_TOKENS = 1024
 CLAUDE_MAX_RETRIES = 4
 WEB_SEARCH_TOOL_VERSION = "web_search_20250305"
+# Cap web searches per Claude call. Each search is ~$0.01 plus the model
+# pays input-token cost on every search result on subsequent turns, so an
+# uncapped tool can quietly run away.
+ENRICH_MAX_SEARCHES = 3
 
 # Cap per-run contact discovery to keep runs bounded.
-MAX_CONTACT_DISCOVERIES_PER_RUN = 50
+MAX_CONTACT_DISCOVERIES_PER_RUN = 5
 CONTACT_DISCOVERY_SLEEP_SECONDS = 0.5
 
 # When True, the pipeline stops after the classification step: no company
@@ -153,7 +157,11 @@ def enrich_company(client: anthropic.Anthropic, company: str) -> dict | None:
                 model=CLAUDE_MODEL,
                 max_tokens=CLAUDE_MAX_TOKENS,
                 messages=messages,
-                tools=[{"type": WEB_SEARCH_TOOL_VERSION, "name": "web_search"}],
+                tools=[{
+                    "type": WEB_SEARCH_TOOL_VERSION,
+                    "name": "web_search",
+                    "max_uses": ENRICH_MAX_SEARCHES,
+                }],
                 output_config={
                     "format": {"type": "json_schema", "schema": ENRICH_SCHEMA}
                 },
