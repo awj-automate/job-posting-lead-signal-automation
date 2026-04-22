@@ -53,6 +53,10 @@ ENRICH_MAX_SEARCHES = 3
 MAX_CONTACT_DISCOVERIES_PER_RUN = 5
 CONTACT_DISCOVERY_SLEEP_SECONDS = 0.5
 
+# TEMPORARY: cap raw scrape rows to manage cost during testing.
+# Set to None to disable.
+SCRAPE_ROW_LIMIT = 50
+
 # When True, the pipeline stops after the classification step: no company
 # upserts, no Claude enrichment, no contact discovery, no Instantly sync.
 # Just scrape + dedupe + look everything up against the DB cache and log
@@ -257,8 +261,15 @@ def main() -> None:
             if not DRY_RUN:
                 db.finish_run(conn, run_id, jobs_scraped=0)
             return
+        total_scraped = len(df)
+        print(f"Scraped {total_scraped} rows before dedupe")
+        if SCRAPE_ROW_LIMIT and total_scraped > SCRAPE_ROW_LIMIT:
+            print(
+                f"TEMP CAP: keeping first {SCRAPE_ROW_LIMIT} of "
+                f"{total_scraped} rows (dropping {total_scraped - SCRAPE_ROW_LIMIT})"
+            )
+            df = df.head(SCRAPE_ROW_LIMIT)
         scraped_count = len(df)
-        print(f"Scraped {scraped_count} rows before dedupe")
 
         df = dedupe_by_company(df)
         print(f"{len(df)} companies after within-run dedupe")
@@ -388,7 +399,7 @@ def main() -> None:
         for i, c in enumerate(pending_contacts, 1):
             print(f"[{i}/{len(pending_contacts)}] {c.name}")
             contacts_found += contacts.discover_for_company(
-                conn, c.id, c.name, c.domain, client,
+                conn, c.id, c.name, c.domain,
             )
             if i < len(pending_contacts):
                 time.sleep(CONTACT_DISCOVERY_SLEEP_SECONDS)
