@@ -49,8 +49,6 @@ WEB_SEARCH_TOOL_VERSION = "web_search_20250305"
 # uncapped tool can quietly run away.
 ENRICH_MAX_SEARCHES = 3
 
-# Cap per-run contact discovery to keep runs bounded.
-MAX_CONTACT_DISCOVERIES_PER_RUN = 5
 CONTACT_DISCOVERY_SLEEP_SECONDS = 0.5
 
 # Cap raw scrape rows per run. Set to None to disable.
@@ -366,9 +364,7 @@ def main() -> None:
         # Phase 2: find + verify contacts for passing companies that haven't
         # been through contact discovery yet.
         contacts_found = 0
-        pending_contacts = db.load_companies_pending_contacts(
-            conn, MAX_CONTACT_DISCOVERIES_PER_RUN
-        )
+        pending_contacts = db.load_companies_pending_contacts(conn)
         print(f"Contact discovery: {len(pending_contacts)} companies to process")
         for i, c in enumerate(pending_contacts, 1):
             print(f"[{i}/{len(pending_contacts)}] {c.name}")

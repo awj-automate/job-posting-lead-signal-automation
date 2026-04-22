@@ -122,18 +122,16 @@ def update_company_lookup(
 
 
 def load_companies_pending_contacts(
-    conn: psycopg.Connection, limit: int
+    conn: psycopg.Connection,
 ) -> list[PendingContactCompany]:
-    """Passed companies whose contacts haven't been discovered yet."""
+    """Every passed company whose contacts haven't been discovered yet."""
     with conn.cursor(row_factory=dict_row) as cur:
         cur.execute(
             """
             SELECT id, name, domain FROM companies
             WHERE passed_lookup = 'yes' AND contacts_discovered_at IS NULL
             ORDER BY first_seen_at
-            LIMIT %s
-            """,
-            (limit,),
+            """
         )
         return [PendingContactCompany(**r) for r in cur.fetchall()]
 
