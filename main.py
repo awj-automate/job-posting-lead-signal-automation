@@ -11,7 +11,6 @@ so failures are auditable.
 """
 
 import json
-import re
 import time
 import traceback
 
@@ -54,19 +53,8 @@ ENRICH_MAX_SEARCHES = 3
 MAX_CONTACT_DISCOVERIES_PER_RUN = 5
 CONTACT_DISCOVERY_SLEEP_SECONDS = 0.5
 
-# TEMPORARY: cap raw scrape rows to manage cost during testing.
-# Set to None to disable.
-SCRAPE_ROW_LIMIT = 50
-
-# When True, the pipeline stops after the classification step: no company
-# upserts, no Claude enrichment, no contact discovery, no Instantly sync.
-# Just scrape + dedupe + look everything up against the DB cache and log
-# how many rows each bucket would have produced.
-DRY_RUN = False
-
-# When True, skip the entire pipeline and just fire canned AMF probes to
-# diagnose 400 errors. Set False to resume normal runs.
-AMF_TEST_MODE = False
+# Cap raw scrape rows per run. Set to None to disable.
+SCRAPE_ROW_LIMIT = 100
 
 
 def scrape_all() -> pd.DataFrame:
@@ -239,89 +227,24 @@ def _s(v) -> str:
     return str(v)
 
 
-def _domain_from_url(url: str) -> str | None:
-    if not url:
-        return None
-    m = re.search(r"https?://([^/?#]+)", url)
-    if not m:
-        return None
-    host = m.group(1).lower()
-    return host[4:] if host.startswith("www.") else host
-
-
-def run_amf_test() -> None:
-    """Fire canned probes against AMF and dump full request/response.
-    Used to diagnose 400 errors and find which payload shapes AMF accepts
-    for company-only inputs."""
-    import os as _os
-    import requests as _req
-
-    headers = {
-        "Authorization": _os.environ["ANYMAILFINDER_API_KEY"],
-        "Content-Type": "application/json",
-    }
-    cases = [
-        (
-            "Missing domain and company_name (expect 400 with 'missing required')",
-            {"decision_maker_category": ["ceo"]},
-        ),
-        (
-            "Artmac via company_name field",
-            {"company_name": "Artmac", "decision_maker_category": ["ceo"]},
-        ),
-        (
-            "Artmac via domain field",
-            {"domain": "Artmac", "decision_maker_category": ["ceo"]},
-        ),
-        (
-            "artmac.com via domain field",
-            {"domain": "artmac.com", "decision_maker_category": ["ceo"]},
-        ),
-    ]
-    for label, payload in cases:
-        print(f"\n=== AMF probe: {label} ===")
-        print(f"Payload: {json.dumps(payload)}")
-        try:
-            r = _req.post(
-                "https://api.anymailfinder.com/v5.1/find-email/decision-maker",
-                headers=headers,
-                json=payload,
-                timeout=60,
-            )
-            print(f"HTTP {r.status_code}")
-            print(f"Body: {r.text[:800]}")
-        except Exception as e:
-            print(f"Exception: {e}")
-
-
 def main() -> None:
-    if AMF_TEST_MODE:
-        print("*** AMF_TEST_MODE — running probes only, exiting after ***")
-        run_amf_test()
-        return
-
     conn = db.connect()
     db.init_schema(conn)
 
-    if DRY_RUN:
-        print("*** DRY RUN — no DB writes, no API calls past the scrape ***")
-        run_id = None
-    else:
-        run_id = db.start_run(conn)
-        print(f"Starting run {run_id}")
+    run_id = db.start_run(conn)
+    print(f"Starting run {run_id}")
     try:
         df = scrape_all()
         if df.empty:
             print("No jobs scraped.")
-            if not DRY_RUN:
-                db.finish_run(conn, run_id, jobs_scraped=0)
+            db.finish_run(conn, run_id, jobs_scraped=0)
             return
         total_scraped = len(df)
         print(f"Scraped {total_scraped} rows before dedupe")
         if SCRAPE_ROW_LIMIT and total_scraped > SCRAPE_ROW_LIMIT:
             print(
-                f"TEMP CAP: keeping first {SCRAPE_ROW_LIMIT} of "
-                f"{total_scraped} rows (dropping {total_scraped - SCRAPE_ROW_LIMIT})"
+                f"Capping at first {SCRAPE_ROW_LIMIT} of {total_scraped} rows "
+                f"(dropping {total_scraped - SCRAPE_ROW_LIMIT})"
             )
             df = df.head(SCRAPE_ROW_LIMIT)
         scraped_count = len(df)
@@ -329,8 +252,7 @@ def main() -> None:
         df = dedupe_by_company(df)
         print(f"{len(df)} companies after within-run dedupe")
         if df.empty:
-            if not DRY_RUN:
-                db.finish_run(conn, run_id, jobs_scraped=0)
+            db.finish_run(conn, run_id, jobs_scraped=0)
             return
 
         cache = db.load_companies(conn)
@@ -356,52 +278,44 @@ def main() -> None:
                 passed = (c.passed_lookup or "").lower()
                 if passed == "yes":
                     companies_cached_yes += 1
-                    if not DRY_RUN:
-                        entries.append((c.id, job, False))
+                    entries.append((c.id, job, False))
                 elif passed == "no":
                     companies_cached_no += 1
-                    if not DRY_RUN:
-                        entries.append((c.id, job, False))
+                    entries.append((c.id, job, False))
                 else:
                     companies_pending_lookup += 1
-                    if not DRY_RUN:
-                        entries.append((c.id, job, True))
+                    entries.append((c.id, job, True))
             else:
                 companies_new += 1
-                if not DRY_RUN:
-                    # Don't insert a domain from company_url — jobspy almost
-                    # always returns a job-board URL (linkedin / indeed),
-                    # which is useless. Let Claude enrichment provide the
-                    # real domain via web search.
-                    cid = db.upsert_company(conn, name, key, None)
-                    cache[key] = db.Company(
-                        id=cid,
-                        name=name,
-                        normalized_key=key,
-                        domain=None,
-                        employee_count=None,
-                        industry=None,
-                        passed_lookup=None,
-                        rejection_reason=None,
-                    )
-                    cache_keys.append(key)
-                    entries.append((cid, job, True))
+                # Don't insert a domain from company_url — jobspy almost
+                # always returns a job-board URL (linkedin / indeed),
+                # which is useless. Let Claude enrichment provide the
+                # real domain via web search.
+                cid = db.upsert_company(conn, name, key, None)
+                cache[key] = db.Company(
+                    id=cid,
+                    name=name,
+                    normalized_key=key,
+                    domain=None,
+                    employee_count=None,
+                    industry=None,
+                    passed_lookup=None,
+                    rejection_reason=None,
+                )
+                cache_keys.append(key)
+                entries.append((cid, job, True))
 
-        would_enrich = companies_new + companies_pending_lookup
+        to_enrich = companies_new + companies_pending_lookup
         print(
             "\n=== Classification summary ===\n"
-            f"  Scraped (pre-dedupe):                     {scraped_count}\n"
+            f"  Scraped (after cap):                      {scraped_count}\n"
             f"  After within-run dedupe:                  {len(df)}\n"
-            f"  Already cached Yes (would skip enrich):   {companies_cached_yes}\n"
-            f"  Already cached No  (would skip enrich):   {companies_cached_no}\n"
+            f"  Already cached Yes (skipping enrich):     {companies_cached_yes}\n"
+            f"  Already cached No  (skipping enrich):     {companies_cached_no}\n"
             f"  Known to DB but lookup pending (retry):   {companies_pending_lookup}\n"
-            f"  Never seen before (would insert+enrich):  {companies_new}\n"
-            f"  => WOULD ENRICH NEXT:                     {would_enrich} companies\n"
+            f"  Never seen before (new + enrich):         {companies_new}\n"
+            f"  => Enriching this run:                    {to_enrich} companies\n"
         )
-
-        if DRY_RUN:
-            print("Dry run complete — exiting before any writes.")
-            return
 
         # Record every scraped job (regardless of company status) for history.
         db.insert_jobs(
@@ -480,8 +394,7 @@ def main() -> None:
         )
         print(f"Run {run_id} complete")
     except Exception:
-        if run_id is not None:
-            db.record_run_error(conn, run_id, traceback.format_exc())
+        db.record_run_error(conn, run_id, traceback.format_exc())
         raise
 
 
