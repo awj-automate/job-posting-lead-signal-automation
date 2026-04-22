@@ -48,9 +48,13 @@ def _amf_decision_maker(
     """Call AMF decision-maker. Returns contact dict or None.
 
     Tries categories in priority order (AMF picks the first that resolves
-    to a valid email — we only pay 2 credits when one does)."""
-    if not domain and not company_name:
-        return None
+    to a valid email — we only pay 2 credits when one does).
+
+    AMF accepts either `domain` or `company_name`. Per their docs, if you
+    pass a company name in the `domain` field they'll try to resolve it
+    themselves, which works better in practice than the `company_name`
+    field. So we always send via `domain`: the real domain when we have a
+    clean one, otherwise the company name as a domain-resolution hint."""
     payload = {
         "decision_maker_category": [
             "ceo", "operations", "engineering", "finance", "sales", "marketing",
@@ -58,8 +62,10 @@ def _amf_decision_maker(
     }
     if _is_valid_company_domain(domain):
         payload["domain"] = domain
+    elif company_name:
+        payload["domain"] = company_name
     else:
-        payload["company_name"] = company_name
+        return None
 
     try:
         resp = requests.post(
@@ -74,7 +80,16 @@ def _amf_decision_maker(
         resp.raise_for_status()
         data = resp.json()
     except requests.RequestException as e:
-        print(f"  AMF error for {company_name!r}: {e}")
+        body = ""
+        if getattr(e, "response", None) is not None:
+            try:
+                body = e.response.text[:300]
+            except Exception:
+                pass
+        print(
+            f"  AMF error for {company_name!r} (sent={payload}): "
+            f"{e} | body={body}"
+        )
         return None
 
     if data.get("email_status") != "valid" or not data.get("valid_email"):
