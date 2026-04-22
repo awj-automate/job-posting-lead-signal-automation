@@ -63,6 +63,10 @@ SCRAPE_ROW_LIMIT = 50
 # how many rows each bucket would have produced.
 DRY_RUN = False
 
+# When True, skip the entire pipeline and just fire canned AMF probes to
+# diagnose 400 errors. Set False to resume normal runs.
+AMF_TEST_MODE = True
+
 
 def scrape_all() -> pd.DataFrame:
     frames = []
@@ -244,7 +248,57 @@ def _domain_from_url(url: str) -> str | None:
     return host[4:] if host.startswith("www.") else host
 
 
+def run_amf_test() -> None:
+    """Fire canned probes against AMF and dump full request/response.
+    Used to diagnose 400 errors and find which payload shapes AMF accepts
+    for company-only inputs."""
+    import os as _os
+    import requests as _req
+
+    headers = {
+        "Authorization": _os.environ["ANYMAILFINDER_API_KEY"],
+        "Content-Type": "application/json",
+    }
+    cases = [
+        (
+            "Missing domain and company_name (expect 400 with 'missing required')",
+            {"decision_maker_category": ["ceo"]},
+        ),
+        (
+            "Artmac via company_name field",
+            {"company_name": "Artmac", "decision_maker_category": ["ceo"]},
+        ),
+        (
+            "Artmac via domain field",
+            {"domain": "Artmac", "decision_maker_category": ["ceo"]},
+        ),
+        (
+            "artmac.com via domain field",
+            {"domain": "artmac.com", "decision_maker_category": ["ceo"]},
+        ),
+    ]
+    for label, payload in cases:
+        print(f"\n=== AMF probe: {label} ===")
+        print(f"Payload: {json.dumps(payload)}")
+        try:
+            r = _req.post(
+                "https://api.anymailfinder.com/v5.1/find-email/decision-maker",
+                headers=headers,
+                json=payload,
+                timeout=60,
+            )
+            print(f"HTTP {r.status_code}")
+            print(f"Body: {r.text[:800]}")
+        except Exception as e:
+            print(f"Exception: {e}")
+
+
 def main() -> None:
+    if AMF_TEST_MODE:
+        print("*** AMF_TEST_MODE — running probes only, exiting after ***")
+        run_amf_test()
+        return
+
     conn = db.connect()
     db.init_schema(conn)
 

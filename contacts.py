@@ -32,7 +32,9 @@ JUNK_DOMAINS = {
 }
 
 
-def _is_valid_company_domain(domain: str | None) -> bool:
+def is_valid_company_domain(domain: str | None) -> bool:
+    """Reject empty / job-board / malformed domains.
+    Also used by main.py to filter Claude's domain output before storing."""
     if not domain or "." not in domain or " " in domain:
         return False
     d = domain.lower()
@@ -56,11 +58,9 @@ def _amf_decision_maker(
     field. So we always send via `domain`: the real domain when we have a
     clean one, otherwise the company name as a domain-resolution hint."""
     payload = {
-        "decision_maker_category": [
-            "ceo", "operations", "engineering", "finance", "sales", "marketing",
-        ],
+        "decision_maker_category": ["ceo", "operations", "marketing"],
     }
-    if _is_valid_company_domain(domain):
+    if is_valid_company_domain(domain):
         payload["domain"] = domain
     elif company_name:
         payload["domain"] = company_name
